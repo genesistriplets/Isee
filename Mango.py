@@ -2,17 +2,63 @@ import serial
 import time
 import cv2
 from ultralytics import YOLO
-import sys
 import threading
+import queue
+import os
 
-# Configuration
+# --- Configuration ---
 SERIAL_PORT = '/dev/ttyUSB0'
-BAUD_RATE = 9600
+BAUD_RATE = 115200  # Increased from 9600 for lower latency
 CONFIDENCE_THRESHOLD = 0.5
-# YOLO Class ID for 'bottle'.
-# Note: In COCO (default YOLO model), 'bottle' is usually ID 39.
-# We will filter by name to be safe.
 TARGET_CLASS = 'bottle'
+MODEL_NAME = "yolo11n.pt"
+
+# --- Threaded Camera Class ---
+# This separates frame capturing from inference to prevent input lag.
+class ThreadedCamera:
+    def __init__(self, src=0, width=320, height=320):
+        self.src = src
+        self.width = width
+        self.height = height
+        self.cap = cv2.VideoCapture(self.src)
+
+        # Optimize Camera Buffer
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
+
+        self.grabbed, self.frame = self.cap.read()
+        self.started = False
+        self.read_lock = threading.Lock()
+
+    def start(self):
+        if self.started:
+            print("Camera already running.")
+            return None
+        self.started = True
+        self.thread = threading.Thread(target=self.update, args=())
+        self.thread.daemon = True
+        self.thread.start()
+        return self
+
+    def update(self):
+        while self.started:
+            grabbed, frame = self.cap.read()
+            with self.read_lock:
+                self.grabbed = grabbed
+                self.frame = frame
+            # No sleep here - grab as fast as hardware allows
+
+    def read(self):
+        with self.read_lock:
+            if not self.grabbed:
+                return None
+            return self.frame.copy()
+
+    def stop(self):
+        self.started = False
+        if self.cap.isOpened():
+            self.cap.release()
 
 class BottleDetector:
     def __init__(self):
@@ -20,48 +66,57 @@ class BottleDetector:
         self.running = True
         self.camera_active = False
         self.show_camera = False
-        self.cap = None
-        self.last_bottle_time = 0  # Timestamp of last sent signal
+        self.cam_thread = None
+        self.last_bottle_time = 0
 
-        # Initialize Serial
-        print(f"Connecting to {SERIAL_PORT}...")
+        # 1. Initialize Serial
+        print(f"Connecting to {SERIAL_PORT} at {BAUD_RATE} baud...")
         while self.ser is None:
             try:
-                self.ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
+                # write_timeout prevents Python from hanging if Arduino is busy
+                self.ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=0.1, write_timeout=0.1)
                 time.sleep(2) # Wait for Arduino reset
             except serial.SerialException:
                 print("Waiting for serial device...")
-                time.sleep(2)
+                time.sleep(1)
 
-        # Initialize Model (Load once to memory to save startup time later)
-        print("Loading YOLOv11n model...")
-        self.model = YOLO("yolo11n.pt")
-        print("Model loaded. Sending Handshake.")
+        # 2. Initialize Model with CPU Optimizations
+        print("Loading Model...")
+        # Check if we can export to OpenVINO for massive CPU speedup (INT8/FP16)
+        try:
+            base_model = YOLO(MODEL_NAME)
+            print("Attempting to load/export OpenVINO model for CPU acceleration...")
+            # This creates a folder named yolo11n_openvino_model
+            export_path = base_model.export(format="openvino", half=True, int8=True)
+            self.model = YOLO(export_path, task="detect")
+            print("Running optimized OpenVINO model.")
+        except Exception as e:
+            print(f"Optimization warning: {e}. Falling back to standard PyTorch.")
+            self.model = base_model
 
-        # Handshake
+        print("System Ready. Sending Handshake.")
         self.ser.write(b"HANDSHAKE\n")
 
     def start_camera(self):
-        if not self.cap or not self.cap.isOpened():
-            self.cap = cv2.VideoCapture(0)
-            # Reduce resolution for speed
-            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 320)
-            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 240)
+        if not self.camera_active:
+            # Re-initialize camera thread
+            self.cam_thread = ThreadedCamera(src=0, width=320, height=320).start()
             self.camera_active = True
-            print("Camera Started. Detection Loop Active.")
+            print("Camera Thread Started.")
 
     def stop_camera(self):
-        if self.cap and self.cap.isOpened():
-            self.cap.release()
+        if self.camera_active and self.cam_thread:
+            self.cam_thread.stop()
+            self.cam_thread = None
         self.camera_active = False
         cv2.destroyAllWindows()
-        print("Camera Stopped. Power Saving Mode.")
+        print("Camera Thread Stopped.")
 
     def run(self):
-        print("System Ready. Waiting for Arduino commands...")
+        print("Waiting for Arduino commands...")
 
         while self.running:
-            # 1. Check Serial Commands
+            # --- 1. Fast Serial Check ---
             if self.ser.in_waiting > 0:
                 try:
                     line = self.ser.readline().decode('utf-8').strip()
@@ -72,69 +127,64 @@ class BottleDetector:
                 except Exception as e:
                     print(f"Serial Error: {e}")
 
-            # 2. Key Input (Non-blocking check via cv2 only if window needed)
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord('c') or key == ord('C'):
-                self.show_camera = True
-                print("Camera View: ON")
-            elif key == ord('e') or key == ord('E'):
-                self.show_camera = False
-                cv2.destroyAllWindows()
-                print("Camera View: OFF")
-            elif key == ord('q'):
-                self.running = False
+            # --- 2. Key Input ---
+            # Use waitKey(1) only if window is visible to save CPU cycles
+            if self.show_camera:
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord('e'): self.show_camera = False; cv2.destroyAllWindows()
+                elif key == ord('q'): self.running = False
 
-            # 3. Detection Logic (Only if camera is active)
-            if self.camera_active and self.cap.isOpened():
-                ret, frame = self.cap.read()
-                if ret:
+            # Allow toggling view even if window closed
+            # (Note: standard input() blocks, so we skip terminal input checks)
+
+            # --- 3. Optimized Detection Loop ---
+            if self.camera_active and self.cam_thread:
+                frame = self.cam_thread.read()
+
+                if frame is not None:
                     # Run Inference
-                    results = self.model.predict(frame, verbose=False, conf=CONFIDENCE_THRESHOLD)
+                    # stream=True reduces memory overhead
+                    # half=False because standard PyTorch CPU doesn't support FP16 well
+                    # (OpenVINO handles the half/int8 internally if loaded above)
+                    results = self.model.predict(
+                        source=frame,
+                        imgsz=320,
+                        conf=CONFIDENCE_THRESHOLD,
+                        verbose=False,
+                        device='cpu',
+                        stream=True
+                    )
 
                     detected = False
 
-                    # Analyze results
+                    # Iterate generator
                     for result in results:
-                        for box in result.boxes:
-                            cls_id = int(box.cls[0])
-                            cls_name = self.model.names[cls_id]
+                        # Fast check for existence of class
+                        if result.boxes:
+                            for cls_id in result.boxes.cls:
+                                if self.model.names[int(cls_id)] == TARGET_CLASS:
+                                    detected = True
+                                    break
 
-                            if cls_name == TARGET_CLASS:
-                                detected = True
-                                # Draw box if view is enabled
-                                if self.show_camera:
-                                    x1, y1, x2, y2 = map(int, box.xyxy[0])
-                                    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                                    cv2.putText(frame, "BOTTLE", (x1, y1 - 10),
-                                              cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                        # Visualization (Only if enabled, saves heavy drawing operations)
+                        if self.show_camera:
+                            res_plotted = result.plot()
+                            cv2.imshow("Bottle Detector View", res_plotted)
 
-                    # Logic: If detected AND enough time passed since last detection
+                    # Signal Logic
                     current_time = time.time()
                     if detected:
+                        # Debounce logic (2.0s cooldown)
                         if (current_time - self.last_bottle_time) > 2.0:
-                            print("Bottle Detected! Sending signal...")
+                            print("!!! BOTTLE DETECTED !!!")
                             self.ser.write(b"BOTTLE\n")
                             self.last_bottle_time = current_time
-                        else:
-                            # Detected but waiting for cooldown
-                            pass
 
-                    # Display logic
-                    if self.show_camera:
-                        cv2.imshow("Bottle Detector View", frame)
-                    else:
-                        try:
-                            if cv2.getWindowProperty("Bottle Detector View", 0) >= 0:
-                                cv2.destroyWindow("Bottle Detector View")
-                        except:
-                            pass
+                # NO SLEEP HERE. Run at max CPU speed.
 
-                # Throttle to approx 2 Frames Per Second (0.5s delay)
-                time.sleep(0.5)
-
-            # Small sleep to prevent CPU hogging in idle mode
-            if not self.camera_active:
-                time.sleep(0.1)
+            else:
+                # If camera is off, sleep slightly to save CPU
+                time.sleep(0.05)
 
         # Cleanup
         self.stop_camera()
@@ -145,5 +195,5 @@ if __name__ == "__main__":
     try:
         app.run()
     except KeyboardInterrupt:
-        print("Exiting...")
         app.stop_camera()
+        print("Exiting...")
